@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - KUBECONFIG=/home/bot/.kube/config
+    volumes:
+      - ./sre-bot-kubeconfig.yaml:/home/bot/.kube/config:ro
+      - ./.claude:/app/.claude

@@ -1,0 +1,4 @@
+claude-agent-sdk
+aiogram~=3.26
+python-dotenv
+anyio

@@ -1,0 +1,271 @@
+import logging
+import re
+from pathlib import Path
+
+from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    TextBlock,
+    ResultMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+
+_CLAUDE_ERROR_MESSAGES: dict[str, str] = {
+    "billing_error": (
+        "💳 Insufficient API credits.\n"
+        "Top up at: https://console.anthropic.com/settings/billing"
+    ),
+    "rate_limit_error": "⏳ Claude API rate limit reached. Please wait a moment and try again.",
+    "authentication_error": "🔑 Anthropic API key is invalid or missing. Check the ANTHROPIC_API_KEY env var.",
+    "overloaded_error": "🔥 Claude is overloaded right now. Please try again in a few seconds.",
+    "invalid_request_error": "❌ Invalid request sent to Claude. Check the bot configuration.",
+}
+
+_DEFAULT_ERROR_MESSAGE = "❌ Claude API error: {code}"
+
+
+class ClaudeAPIError(Exception):
+    """Raised when Claude returns a known API error."""
+
+    def __init__(self, code: str, user_message: str) -> None:
+        super().__init__(code)
+        self.code = code
+        self.user_message = user_message
+
+
+def _make_api_error(code: str) -> ClaudeAPIError:
+    msg = _CLAUDE_ERROR_MESSAGES.get(code, _DEFAULT_ERROR_MESSAGE.format(code=code))
+    return ClaudeAPIError(code=code, user_message=msg)
+
+
+# ── Safety ────────────────────────────────────────────────────────────────────
+
+# Bash commands that are never allowed, regardless of skill or user request.
+# Checked as substrings of the full command (case-insensitive).
+BLOCKED_BASH_PATTERNS: list[str] = [
+    # Kubernetes — destructive mutations
+    "kubectl delete",
+    "kubectl apply",
+    "kubectl create",
+    "kubectl patch",
+    "kubectl edit",
+    "kubectl replace",
+    "kubectl rollout restart",
+    "kubectl rollout undo",
+    "kubectl scale",
+    "kubectl drain",
+    "kubectl cordon",
+    "kubectl uncordon",
+    "kubectl taint",
+    # Kubernetes — sensitive data
+    "kubectl get secret",
+    "kubectl get secrets",
+    "kubectl describe secret",
+    "kubectl exec",          # shell into pods
+    "kubectl cp",            # copy files from/to pods
+    "kubectl proxy",         # exposes API server
+    "kubectl port-forward",  # network exposure
+    # Shell — file system
+    "rm ",
+    "rm\t",
+    "rmdir",
+    "shred",
+    " > /",                  # redirect writes to absolute paths
+    "tee /",
+    # Shell — privilege escalation
+    "sudo ",
+    "su ",
+    "chmod ",
+    "chown ",
+]
+
+
+async def can_use_tool(
+    tool_name: str,
+    input_data: dict,
+    context: ToolPermissionContext,
+) -> PermissionResultAllow | PermissionResultDeny:
+    """Block dangerous bash commands before execution."""
+    if tool_name == "Bash":
+        command = input_data.get("command", "")
+        command_lower = command.lower()
+        for pattern in BLOCKED_BASH_PATTERNS:
+            if pattern.lower() in command_lower:
+                logger.warning("Blocked command: %s", command[:120])
+                return PermissionResultDeny(
+                    message=(
+                        f"Blocked: pattern '{pattern}' is not allowed. "
+                        "Only read-only operations are permitted."
+                    ),
+                    interrupt=True,
+                )
+    return PermissionResultAllow(updated_input=input_data)
+
+
+# ── Skill routing ──────────────────────────────────────────────────────────────
+
+_SKILLS_DIR = Path(__file__).parent.parent / ".claude" / "skills"
+
+
+def _parse_frontmatter(text: str) -> dict[str, str]:
+    m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return {}
+    result: dict[str, str] = {}
+    for line in m.group(1).splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            result[k.strip()] = v.strip()
+    return result
+
+
+def _build_routing_rules() -> str:
+    """Read all skill files and build mandatory subagent routing rules."""
+    if not _SKILLS_DIR.exists():
+        return ""
+    rules: list[str] = []
+    for path in sorted(_SKILLS_DIR.glob("*.md")):
+        fm = _parse_frontmatter(path.read_text())
+        agent = fm.get("agent")
+        desc = fm.get("description", "").strip()
+        if agent and desc:
+            rules.append(f'• {desc} → Agent tool, subagent="{agent}"')
+    if not rules:
+        return ""
+    lines = [
+        "\n\nSUBAGENT ROUTING — MANDATORY:",
+        "When a user request matches one of the rules below, you MUST use the Agent tool",
+        "to delegate the task. Do NOT use Bash or any other tool yourself.",
+    ] + rules
+    return "\n".join(lines)
+
+
+# ── Agent config ───────────────────────────────────────────────────────────────
+
+_BASE_SYSTEM_PROMPT = (
+    "You are an expert DevOps and SRE assistant. "
+    "You help engineers diagnose and resolve infrastructure incidents, "
+    "monitor Kubernetes clusters, analyze alerts, and provide clear, "
+    "actionable remediation steps. "
+    "Responses are delivered via Telegram — keep them concise, use plain text, "
+    "avoid markdown headers. Use short bullet lists where helpful.\n\n"
+    "IMPORTANT: You are read-only. Never delete, modify, apply, or create "
+    "any Kubernetes resources or files. Never read Secrets. "
+    "If an action requires write access, describe the command the engineer "
+    "should run manually instead."
+)
+
+SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _build_routing_rules()
+logger.debug("System prompt routing section:\n%s", SYSTEM_PROMPT[len(_BASE_SYSTEM_PROMPT):])
+
+def _on_stderr(line: str) -> None:
+    logger.error("Claude CLI stderr: %s", line.rstrip())
+
+
+OPTIONS = ClaudeAgentOptions(
+    system_prompt=SYSTEM_PROMPT,
+    model="claude-haiku-4-5-20251001",
+    permission_mode="bypassPermissions",
+    allowed_tools=["Bash", "Agent"],
+    disallowed_tools=["Write", "Edit", "NotebookEdit"],  # never write files
+    cwd="/app",
+    setting_sources=["project"],
+    can_use_tool=can_use_tool,
+    stderr=_on_stderr,
+    agents={
+        "haiku": AgentDefinition(
+            description="Executes routine operational tasks quickly and cheaply.",
+            prompt=(
+                "You are an efficient SRE operations assistant. "
+                "Execute tasks quickly and report findings concisely. "
+                "Plain text only, no markdown headers. "
+                "Read-only: never delete or modify any resources."
+            ),
+            tools=["Bash"],
+            model="haiku",
+        ),
+        "sonnet": AgentDefinition(
+            description="Performs analysis, incident triage, and problem-solving.",
+            prompt=(
+                "You are an SRE incident response expert. "
+                "Analyze problems thoroughly and provide clear, prioritized action steps. "
+                "Plain text only, no markdown headers. "
+                "Read-only: never delete or modify any resources."
+            ),
+            tools=["Bash"],
+            model="sonnet",
+        ),
+        "opus": AgentDefinition(
+            description="Handles complex analysis, postmortems, and architectural decisions.",
+            prompt=(
+                "You are a senior SRE architect. "
+                "Perform deep analysis and think through all implications carefully. "
+                "Plain text only, no markdown headers. "
+                "Read-only: never delete or modify any resources."
+            ),
+            tools=["Bash"],
+            model="opus",
+        ),
+    },
+)
+
+# ── Model label helpers ────────────────────────────────────────────────────────
+
+_MODEL_LABELS = {"haiku": "Haiku", "sonnet": "Sonnet", "opus": "Opus"}
+
+
+def _short_model(raw_name: str) -> str:
+    lower = raw_name.lower()
+    for key, label in _MODEL_LABELS.items():
+        if key in lower:
+            return label
+    return raw_name
+
+
+# ── Main query ─────────────────────────────────────────────────────────────────
+
+async def _as_stream(text: str):
+    """Wrap a plain string as AsyncIterable — required for can_use_tool."""
+    yield {"type": "user", "message": {"role": "user", "content": text}}
+
+
+async def ask_claude(prompt: str) -> tuple[str, str | None]:
+    """Send a prompt to Claude. Returns (response_text, cost_info)."""
+    response_parts: list[str] = []
+    cost_info: str | None = None
+    models_seen: list[str] = []  # ordered, deduped
+
+    async for message in query(prompt=_as_stream(prompt), options=OPTIONS):
+        logger.debug("SDK message: type=%s %s", type(message).__name__, vars(message))
+        if isinstance(message, AssistantMessage):
+            error_code = getattr(message, "error", None)
+            if error_code:
+                logger.error("AssistantMessage error: %s", error_code)
+                raise _make_api_error(error_code)
+            raw_model = getattr(message, "model", None)
+            if raw_model and raw_model != "<synthetic>":
+                label = _short_model(raw_model)
+                if label not in models_seen:
+                    models_seen.append(label)
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    response_parts.append(block.text)
+        elif isinstance(message, ResultMessage):
+            duration_s = message.duration_ms / 1000
+            cost = message.total_cost_usd or 0
+            turns = message.num_turns
+            models_str = " + ".join(models_seen) if models_seen else "?"
+            cost_info = f"{models_str} · ${cost:.4f} · {duration_s:.1f}s · {turns} turns"
+            if message.is_error:
+                logger.error("Session %s error: subtype=%s", message.session_id, message.subtype)
+                raise _make_api_error(message.subtype or "session_error")
+            logger.info("Session %s finished: %s", message.session_id, cost_info)
+
+    text = "".join(response_parts) or "No response from Claude."
+    return text, cost_info
