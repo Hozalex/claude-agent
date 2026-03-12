@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -83,6 +84,21 @@ BLOCKED_BASH_PATTERNS: list[str] = [
     "su ",
     "chmod ",
     "chown ",
+    # Secrets — environment variables
+    "printenv",
+    "env ",
+    "env\t",
+    "env\n",
+    # Secrets — sensitive filesystem paths
+    "/proc/self/environ",   # env vars via procfs
+    "/proc/self/mem",       # process memory
+    "/var/run/secrets/",    # k8s service account token
+    "~/.ssh/",              # SSH keys
+    "~/.aws/",              # AWS credentials
+    "~/.kube/",             # kubeconfig (use in-cluster SA instead)
+    # Secrets — bot source and config
+    "/app/bot/",            # bot source code (contains logic, not secrets, but unnecessary)
+    "/app/.env",            # env file if present
 ]
 
 
@@ -168,12 +184,15 @@ def _on_stderr(line: str) -> None:
     logger.error("Claude CLI stderr: %s", line.rstrip())
 
 
+_MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "10"))
+
 OPTIONS = ClaudeAgentOptions(
     system_prompt=SYSTEM_PROMPT,
     model="claude-haiku-4-5-20251001",
     permission_mode="bypassPermissions",
     allowed_tools=["Bash", "Agent"],
     disallowed_tools=["Write", "Edit", "NotebookEdit"],  # never write files
+    max_turns=_MAX_TURNS,
     cwd="/app",
     setting_sources=["project"],
     can_use_tool=can_use_tool,
