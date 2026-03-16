@@ -101,6 +101,13 @@ BLOCKED_BASH_PATTERNS: list[str] = [
     "/app/.env",            # env file if present
 ]
 
+# Compiled once at module load for fast case-insensitive matching in can_use_tool.
+# Replaces the per-call loop that repeatedly called pattern.lower() on all 40+ entries.
+_BLOCKED_BASH_REGEX: re.Pattern[str] = re.compile(
+    "|".join(re.escape(p) for p in BLOCKED_BASH_PATTERNS),
+    re.IGNORECASE,
+)
+
 
 async def can_use_tool(
     tool_name: str,
@@ -110,17 +117,17 @@ async def can_use_tool(
     """Block dangerous bash commands before execution."""
     if tool_name == "Bash":
         command = input_data.get("command", "")
-        command_lower = command.lower()
-        for pattern in BLOCKED_BASH_PATTERNS:
-            if pattern.lower() in command_lower:
-                logger.warning("Blocked command: %s", command[:120])
-                return PermissionResultDeny(
-                    message=(
-                        f"Blocked: pattern '{pattern}' is not allowed. "
-                        "Only read-only operations are permitted."
-                    ),
-                    interrupt=True,
-                )
+        m = _BLOCKED_BASH_REGEX.search(command)
+        if m:
+            pattern = m.group().lower()  # lower() recovers the original pattern (all patterns are lowercase)
+            logger.warning("Blocked command: %s", command[:120])
+            return PermissionResultDeny(
+                message=(
+                    f"Blocked: pattern '{pattern}' is not allowed. "
+                    "Only read-only operations are permitted."
+                ),
+                interrupt=True,
+            )
     return PermissionResultAllow(updated_input=input_data)
 
 
