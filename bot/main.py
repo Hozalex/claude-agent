@@ -41,23 +41,25 @@ async def handle_start(message: Message) -> None:
 async def _run_claude(message: Message, prompt: str) -> None:
     """Send prompt to Claude and reply with the result."""
     thinking = await message.answer("⏳ Thinking...")
+    error_reply: str | None = None
+    reply: str | None = None
+    cost_info: str | None = None
     try:
         reply, cost_info = await ask_claude(prompt)
     except ClaudeAPIError as exc:
         logger.error("Claude API error [%s]: %s", exc.code, exc.user_message)
-        await thinking.delete()
-        await message.answer(exc.user_message)
-        return
+        error_reply = exc.user_message
     except Exception:
         logger.exception("Error calling Claude")
+        error_reply = "❌ An error occurred. Please try again."
+    finally:
         await thinking.delete()
-        await message.answer("❌ An error occurred. Please try again.")
-        return
 
-    await thinking.delete()
-    if cost_info:
+    if error_reply is not None:
+        await message.answer(error_reply)
+    elif cost_info:
         await message.answer(f"{reply}\n\n─\n🔢 {cost_info}")
-    else:
+    elif reply is not None:
         await message.answer(reply)
 
 

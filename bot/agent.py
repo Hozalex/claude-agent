@@ -186,6 +186,11 @@ def _on_stderr(line: str) -> None:
 
 _MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "10"))
 
+_SUBAGENT_READONLY_FOOTER = (
+    "Plain text only, no markdown headers. "
+    "Read-only: never delete or modify any resources."
+)
+
 OPTIONS = ClaudeAgentOptions(
     system_prompt=SYSTEM_PROMPT,
     model="claude-haiku-4-5-20251001",
@@ -203,8 +208,7 @@ OPTIONS = ClaudeAgentOptions(
             prompt=(
                 "You are an efficient SRE operations assistant. "
                 "Execute tasks quickly and report findings concisely. "
-                "Plain text only, no markdown headers. "
-                "Read-only: never delete or modify any resources."
+                + _SUBAGENT_READONLY_FOOTER
             ),
             tools=["Bash"],
             model="haiku",
@@ -214,8 +218,7 @@ OPTIONS = ClaudeAgentOptions(
             prompt=(
                 "You are an SRE incident response expert. "
                 "Analyze problems thoroughly and provide clear, prioritized action steps. "
-                "Plain text only, no markdown headers. "
-                "Read-only: never delete or modify any resources."
+                + _SUBAGENT_READONLY_FOOTER
             ),
             tools=["Bash"],
             model="sonnet",
@@ -225,8 +228,7 @@ OPTIONS = ClaudeAgentOptions(
             prompt=(
                 "You are a senior SRE architect. "
                 "Perform deep analysis and think through all implications carefully. "
-                "Plain text only, no markdown headers. "
-                "Read-only: never delete or modify any resources."
+                + _SUBAGENT_READONLY_FOOTER
             ),
             tools=["Bash"],
             model="opus",
