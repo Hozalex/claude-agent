@@ -174,6 +174,10 @@ def _build_routing_rules() -> str:
 
 # ── Agent config ───────────────────────────────────────────────────────────────
 
+# Common constraints appended to every subagent's prompt.
+_SUBAGENT_PROMPT_SUFFIX = "Plain text only, no markdown headers. Read-only: never delete or modify any resources."
+
+
 _BASE_SYSTEM_PROMPT = (
     "You are an expert DevOps and SRE assistant. "
     "You help engineers diagnose and resolve infrastructure incidents, "
@@ -220,8 +224,7 @@ OPTIONS = ClaudeAgentOptions(
             prompt=(
                 "You are an efficient SRE operations assistant. "
                 "Execute tasks quickly and report findings concisely. "
-                "Plain text only, no markdown headers. "
-                "Read-only: never delete or modify any resources."
+                + _SUBAGENT_PROMPT_SUFFIX
             ),
             tools=["Bash"],
             model="haiku",
@@ -231,8 +234,7 @@ OPTIONS = ClaudeAgentOptions(
             prompt=(
                 "You are an SRE incident response expert. "
                 "Analyze problems thoroughly and provide clear, prioritized action steps. "
-                "Plain text only, no markdown headers. "
-                "Read-only: never delete or modify any resources."
+                + _SUBAGENT_PROMPT_SUFFIX
             ),
             tools=["Bash"],
             model="sonnet",
@@ -242,8 +244,7 @@ OPTIONS = ClaudeAgentOptions(
             prompt=(
                 "You are a senior SRE architect. "
                 "Perform deep analysis and think through all implications carefully. "
-                "Plain text only, no markdown headers. "
-                "Read-only: never delete or modify any resources."
+                + _SUBAGENT_PROMPT_SUFFIX
             ),
             tools=["Bash"],
             model="opus",
