@@ -23,6 +23,11 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 dp = Dispatcher()
 
 
+def _get_message_text(message: Message) -> str | None:
+    """Return the text or caption of a Telegram message, whichever is present."""
+    return message.text or message.caption
+
+
 @dp.message(CommandStart())
 async def handle_start(message: Message) -> None:
     await message.answer(
@@ -45,16 +50,15 @@ async def _run_claude(message: Message, prompt: str) -> None:
         reply, cost_info = await ask_claude(prompt)
     except ClaudeAPIError as exc:
         logger.error("Claude API error [%s]: %s", exc.code, exc.user_message)
-        await thinking.delete()
         await message.answer(exc.user_message)
         return
     except Exception:
         logger.exception("Error calling Claude")
-        await thinking.delete()
         await message.answer("❌ An error occurred. Please try again.")
         return
+    finally:
+        await thinking.delete()
 
-    await thinking.delete()
     if cost_info:
         await message.answer(f"{reply}\n\n─\n🔢 {cost_info}")
     else:
@@ -75,12 +79,12 @@ def _build_alert_prompt(alert_text: str, user_command: str) -> str:
 @dp.message(F.reply_to_message & (F.text | F.caption))
 async def handle_alert_reply(message: Message) -> None:
     replied = message.reply_to_message
-    alert_text = replied.text or replied.caption  # type: ignore[union-attr]
+    alert_text = _get_message_text(replied)  # type: ignore[arg-type]
     if not alert_text:
         await message.answer("⚠️ The message you replied to has no text.")
         return
 
-    user_command = message.text or message.caption or ""
+    user_command = _get_message_text(message) or ""
     logger.info(
         "Alert triage request from chat_id=%s, alert=%s",
         message.chat.id,
@@ -93,7 +97,7 @@ async def handle_alert_reply(message: Message) -> None:
 # Catch both plain text and commands (e.g. "/check cluster health")
 @dp.message(F.text | F.caption)
 async def handle_message(message: Message) -> None:
-    text = message.text or message.caption
+    text = _get_message_text(message)
     assert text is not None
     logger.info("Message from chat_id=%s: %s", message.chat.id, text[:80])
 
