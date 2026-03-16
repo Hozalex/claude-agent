@@ -1,3 +1,9 @@
 {
-  "includeCoAuthoredBy": false
+  "includeCoAuthoredBy": false,
+  "mcpServers": {
+    "infra": {
+      "command": "python",
+      "args": ["/app/bot/mcp_infra.py"]
+    }
+  }
 }

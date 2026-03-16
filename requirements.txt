@@ -2,3 +2,6 @@ claude-agent-sdk
 aiogram~=3.26
 python-dotenv
 anyio
+asyncpg==0.30.0
+httpx==0.28.1
+mcp>=1.0.0

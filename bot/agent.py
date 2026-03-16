@@ -89,6 +89,9 @@ BLOCKED_BASH_PATTERNS: list[str] = [
     "env ",
     "env\t",
     "env\n",
+    "DATABASE_URL",
+    "ANTHROPIC_API_KEY",
+    "BOT_TOKEN",
     # Secrets — sensitive filesystem paths
     "/proc/self/environ",   # env vars via procfs
     "/proc/self/mem",       # process memory
@@ -174,7 +177,14 @@ _BASE_SYSTEM_PROMPT = (
     "IMPORTANT: You are read-only. Never delete, modify, apply, or create "
     "any Kubernetes resources or files. Never read Secrets. "
     "If an action requires write access, describe the command the engineer "
-    "should run manually instead."
+    "should run manually instead.\n\n"
+    "INFRASTRUCTURE KNOWLEDGE BASE:\n"
+    "You have a search_infrastructure tool that queries a vector index of all Kubernetes "
+    "resources across all clusters (Deployments, Services, HTTPRoutes, RabbitmqClusters, etc.).\n"
+    "Parameters: query (required), cluster (optional), kind (optional), limit (optional, default 5).\n"
+    "Always show the cluster name from results so the engineer knows which cluster is affected.\n"
+    "Use search_infrastructure FIRST before kubectl, especially for questions about what a "
+    "service does, its dependencies, or blast radius of an incident."
 )
 
 SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _build_routing_rules()
@@ -190,7 +200,7 @@ OPTIONS = ClaudeAgentOptions(
     system_prompt=SYSTEM_PROMPT,
     model="claude-haiku-4-5-20251001",
     permission_mode="bypassPermissions",
-    allowed_tools=["Bash", "Agent"],
+    allowed_tools=["Bash", "Agent", "mcp__infra__search_infrastructure"],
     disallowed_tools=["Write", "Edit", "NotebookEdit"],  # never write files
     max_turns=_MAX_TURNS,
     cwd="/app",
