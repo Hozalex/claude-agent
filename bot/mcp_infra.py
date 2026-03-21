@@ -15,6 +15,15 @@ from mcp.server.stdio import stdio_server
 
 server = Server("infra")
 
+_pool: asyncpg.Pool | None = None
+
+
+async def _get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=3)
+    return _pool
+
 
 async def _embed(query: str) -> list[float]:
     url = os.environ.get("EMBEDDINGS_URL", "http://embeddings-api/embed")
@@ -44,21 +53,18 @@ async def _search(
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
 
-    pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=1)
-    try:
-        rows = await pool.fetch(
-            f"""
-            SELECT cluster, kind, name, namespace, content, enriched,
-                   1 - (embedding <=> $1::vector) AS similarity
-            FROM   infrastructure
-            {where}
-            ORDER  BY embedding <=> $1::vector
-            LIMIT  $2
-            """,
-            *params,
-        )
-    finally:
-        await pool.close()
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        f"""
+        SELECT cluster, kind, name, namespace, content, enriched,
+               1 - (embedding <=> $1::vector) AS similarity
+        FROM   infrastructure
+        {where}
+        ORDER  BY embedding <=> $1::vector
+        LIMIT  $2
+        """,
+        *params,
+    )
 
     if not rows:
         return "No results found."
