@@ -72,6 +72,7 @@ BLOCKED_BASH_PATTERNS: list[str] = [
     "kubectl cp",            # copy files from/to pods
     "kubectl proxy",         # exposes API server
     "kubectl port-forward",  # network exposure
+    # kubectl logs is allowed but must use --tail (enforced in can_use_tool)
     # Shell — file system
     "rm ",
     "rm\t",
@@ -122,7 +123,7 @@ async def can_use_tool(
         command = input_data.get("command", "")
         m = _BLOCKED_BASH_REGEX.search(command)
         if m:
-            pattern = m.group().lower()  # lower() recovers the original pattern (all patterns are lowercase)
+            pattern = m.group().lower()
             logger.warning("Blocked command: %s", command[:120])
             return PermissionResultDeny(
                 message=(
@@ -130,6 +131,13 @@ async def can_use_tool(
                     "Only read-only operations are permitted."
                 ),
                 interrupt=True,
+            )
+        # kubectl logs must always include --tail to prevent unbounded output
+        if "kubectl logs" in command and "--tail" not in command:
+            logger.warning("Blocked kubectl logs without --tail: %s", command[:120])
+            return PermissionResultDeny(
+                message="kubectl logs requires --tail=N (e.g. --tail=100). Retry with --tail.",
+                interrupt=False,
             )
     return PermissionResultAllow(updated_input=input_data)
 
@@ -204,9 +212,11 @@ _BASE_SYSTEM_PROMPT = (
     "  development-cluster (aliases: dev, development, dev-cluster)\n"
     "  infra-cluster (aliases: infra, infrastructure, infra-cluster)\n"
     "- Map user's cluster references to the exact context name above before running kubectl.\n"
+    "- If the cluster name in the request does NOT match any known context above — stop immediately "
+    "and tell the user: 'Cluster X is not accessible. Available clusters: development-cluster, infra-cluster.'\n"
     "- If kubectl fails with connection errors, certificate errors, or timeout — explicitly tell the user "
-    "which cluster is unreachable (e.g. 'Cannot connect to development-cluster'). "
-    "Do NOT silently answer from general knowledge if live cluster data was needed.\n\n"
+    "which cluster is unreachable. Do NOT retry with different commands.\n"
+    "- kubectl logs is allowed but MUST include --tail=N (max 200). Without --tail it will be blocked.\n\n"
     "GITOPS AWARENESS:\n"
     "- Before suggesting any change to a resource, check for ArgoCD annotations: "
     "argocd.argoproj.io/tracking-id or argocd.argoproj.io/managed-by.\n"
@@ -222,7 +232,10 @@ _BASE_SYSTEM_PROMPT = (
     "- Do NOT list such signals as user action items or recommendations. The user expects YOU to diagnose, "
     "not to be handed a list of commands to run themselves.\n"
     "- The Recommendations section is only for remediation actions that require human decision "
-    "(scaling nodes, changing Git config, enabling features). Pure diagnostics belong in your analysis.\n\n"
+    "(scaling nodes, changing Git config, enabling features). Pure diagnostics belong in your analysis.\n"
+    "- STOP AND DECLARE LIMITS: If the requested information (e.g. message contents, application logs, "
+    "network traffic) is not accessible through search_infrastructure or kubectl read-only commands — "
+    "say so immediately. Do NOT attempt multiple alternative approaches. One attempt per tool, then conclude.\n\n"
     # "TOOL USAGE: Logs & Metrics\n"  # TODO: enable when log/metric tools are added
     "OUTPUT FORMATTING (TELEGRAM OPTIMIZED):\n"
     "- Use plain text only. No markdown, no headers, no bold, no backticks.\n"
