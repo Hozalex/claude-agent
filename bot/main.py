@@ -4,11 +4,12 @@ import os
 import anyio
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from dotenv import load_dotenv
 
 from bot.agent import ClaudeAPIError, ask_claude
+from bot.status import get_status
 
 load_dotenv()
 
@@ -26,6 +27,19 @@ dp = Dispatcher()
 def _get_message_text(message: Message) -> str | None:
     """Return the text or caption of a Telegram message, whichever is present."""
     return message.text or message.caption
+
+
+@dp.message(Command("status"))
+async def handle_status(message: Message) -> None:
+    checking = await message.answer("Checking...")
+    try:
+        text = await get_status()
+    except Exception:
+        logger.exception("Status check failed")
+        text = "Failed to collect status."
+    finally:
+        await checking.delete()
+    await message.answer(text)
 
 
 @dp.message(CommandStart())
