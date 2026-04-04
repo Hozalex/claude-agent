@@ -13,6 +13,23 @@ logger = logging.getLogger(__name__)
 _KUBECTL_TIMEOUT = 8  # seconds per cluster check
 
 
+def _short_error(exc: Exception, limit: int = 80) -> str:
+    return str(exc)[:limit]
+
+
+async def _http_get_json(
+    url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict | None]:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(url, headers=headers)
+        data = resp.json() if resp.status_code == 200 else None
+        return resp.status_code, data
+
+
 def _get_contexts() -> list[str]:
     """Return all context names from the active kubeconfig."""
     try:
@@ -49,7 +66,7 @@ async def _check_cluster(context: str) -> tuple[str, bool, str]:
             err = stderr.decode().strip().splitlines()[-1] if stderr else "error"
             return context, False, err[:80]
     except Exception as e:
-        return context, False, str(e)[:80]
+        return context, False, _short_error(e)
 
 
 async def _check_db() -> tuple[bool, str]:
@@ -75,43 +92,37 @@ async def _check_db() -> tuple[bool, str]:
 
 async def _check_embeddings() -> tuple[bool, str]:
     try:
-        import httpx
         url = os.environ.get("EMBEDDINGS_URL", "http://embeddings-api/embed")
         health = url.rsplit("/", 1)[0] + "/health"
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(health)
-            if resp.status_code == 200:
-                data = resp.json()
-                model = data.get("model", "?")
-                return True, model
-            return False, f"HTTP {resp.status_code}"
+        status_code, data = await _http_get_json(health, timeout=5.0)
+        if status_code == 200:
+            model = (data or {}).get("model", "?")
+            return True, model
+        return False, f"HTTP {status_code}"
     except Exception as e:
-        return False, str(e)[:80]
+        return False, _short_error(e)
 
 
 async def _check_anthropic() -> tuple[bool, str]:
     """Check Anthropic API key validity and list available models."""
     try:
-        import httpx
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             return False, "ANTHROPIC_API_KEY not set"
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.get(
-                "https://api.anthropic.com/v1/models",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                models = [m["id"] for m in data.get("data", [])]
-                return True, ", ".join(models) if models else "API key valid (no models)"
-            elif resp.status_code in (401, 403):
-                return False, "invalid API key"
-            else:
-                return False, f"HTTP {resp.status_code}"
+        status_code, data = await _http_get_json(
+            "https://api.anthropic.com/v1/models",
+            timeout=8.0,
+            headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+        )
+        if status_code == 200:
+            models = [m["id"] for m in (data or {}).get("data", [])]
+            return True, ", ".join(models) if models else "API key valid (no models)"
+        if status_code in (401, 403):
+            return False, "invalid API key"
+        return False, f"HTTP {status_code}"
     except Exception as e:
         logger.exception("status.anthropic: failed")
-        return False, str(e)[:80]
+        return False, _short_error(e)
 
 
 async def get_status() -> str:
