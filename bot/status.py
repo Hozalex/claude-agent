@@ -3,8 +3,11 @@
 All checks run concurrently with short timeouts.
 """
 import asyncio
+import logging
 import os
 import subprocess
+
+logger = logging.getLogger(__name__)
 
 
 _KUBECTL_TIMEOUT = 8  # seconds per cluster check
@@ -54,15 +57,20 @@ async def _check_db() -> tuple[bool, str]:
         import asyncpg
         dsn = os.environ.get("DATABASE_URL", "")
         if not dsn:
+            logger.error("status.db: DATABASE_URL is not set")
             return False, "DATABASE_URL not set"
+        logger.debug("status.db: connecting to DB")
         conn = await asyncio.wait_for(asyncpg.connect(dsn), timeout=5.0)
         row = await conn.fetchrow("SELECT count(*) AS n FROM infrastructure")
         await conn.close()
+        logger.info("status.db: OK, %s resources indexed", row['n'])
         return True, f"{row['n']} resources indexed"
     except asyncio.TimeoutError:
+        logger.error("status.db: connection timeout")
         return False, "timeout"
     except Exception as e:
-        return False, str(e)[:80]
+        logger.exception("status.db: failed")
+        return False, str(e)
 
 
 async def _check_embeddings() -> tuple[bool, str]:
@@ -82,31 +90,27 @@ async def _check_embeddings() -> tuple[bool, str]:
 
 
 async def _check_anthropic() -> tuple[bool, str]:
-    """Check Anthropic API key validity and fetch workspace balance if available."""
+    """Check Anthropic API key validity and list available models."""
     try:
         import httpx
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             return False, "ANTHROPIC_API_KEY not set"
         async with httpx.AsyncClient(timeout=8.0) as client:
-            # Workspace billing is available via admin API
             resp = await client.get(
-                "https://api.anthropic.com/v1/organizations/billing/credit_grants",
+                "https://api.anthropic.com/v1/models",
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                grants = data.get("data", [])
-                if grants:
-                    remaining = sum(g.get("remaining_credits", 0) for g in grants)
-                    return True, f"${remaining / 100:.2f} credits remaining"
-                return True, "API key valid (no grants info)"
+                models = [m["id"] for m in data.get("data", [])]
+                return True, ", ".join(models) if models else "API key valid (no models)"
             elif resp.status_code in (401, 403):
                 return False, "invalid API key"
             else:
-                # API key is likely valid but balance endpoint not accessible
-                return True, "API key valid (balance unavailable)"
+                return False, f"HTTP {resp.status_code}"
     except Exception as e:
+        logger.exception("status.anthropic: failed")
         return False, str(e)[:80]
 
 
