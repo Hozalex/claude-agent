@@ -241,10 +241,27 @@ _BASE_SYSTEM_PROMPT = (
     "- Use plain text only. No markdown, no headers, no bold, no backticks.\n"
     "- Be extremely concise. Get straight to the point.\n"
     "- Use short bullet points (-) for steps or lists.\n"
-    "- Write commands and resource names as plain text (e.g. kubectl rollout restart deploy/foo)."
+    "- Write commands and resource names as plain text (e.g. kubectl rollout restart deploy/foo).\n"
+    "- Respond in the same language as the user's message.\n"
+    "- All technical names (pod, deployment, namespace, node, service, ingress, etc.) always in English regardless of response language."
 )
 
-SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _build_routing_rules()
+def _load_extra_prompt() -> str:
+    """Load optional prompt extension from a mounted ConfigMap file."""
+    path = os.environ.get("EXTRA_PROMPT_FILE", "/app/config/prompt_extra.txt")
+    try:
+        text = Path(path).read_text().strip()
+        if text:
+            logger.info("Loaded extra prompt from %s (%d chars)", path, len(text))
+            return "\n\n" + text
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.exception("Failed to load extra prompt from %s", path)
+    return ""
+
+
+SYSTEM_PROMPT = _BASE_SYSTEM_PROMPT + _build_routing_rules() + _load_extra_prompt()
 logger.debug("System prompt routing section:\n%s", SYSTEM_PROMPT[len(_BASE_SYSTEM_PROMPT):])
 
 def _on_stderr(line: str) -> None:
