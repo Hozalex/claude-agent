@@ -6,6 +6,7 @@ Runs as a subprocess (stdio transport) managed by Claude Code.
 """
 import asyncio
 import os
+import re
 
 import asyncpg
 import httpx
@@ -13,7 +14,19 @@ import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
+# Works both as a package module (`python -m bot.mcp_infra`) and as a bare script
+# (`python /app/bot/mcp_infra.py`), which is how the MCP server is launched.
+try:
+    from bot.redact import redact
+except ImportError:  # bare-script launch puts /app/bot (not /app) on sys.path
+    from redact import redact
+
 server = Server("infra")
+
+# kubectl identifiers: DNS-1123 / context names. Reject anything else to keep the
+# subprocess argv free of injection and stray flags.
+_IDENT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._\-]{0,252}$")
+_LOGS_MAX_TAIL = 200
 
 _pool: asyncpg.Pool | None = None
 
@@ -83,6 +96,63 @@ async def _search(
     return "\n".join(lines)
 
 
+def _valid_ident(value: str) -> bool:
+    return bool(_IDENT_RE.match(value))
+
+
+async def _get_logs(
+    cluster: str,
+    namespace: str,
+    pod: str,
+    container: str | None,
+    tail: int,
+    previous: bool,
+) -> str:
+    """Run `kubectl logs` read-only and return PII-redacted output.
+
+    This is the ONLY sanctioned path to pod logs: raw `kubectl logs` via Bash is
+    blocked because its output bypasses our code and cannot be redacted. Here the
+    output is held in-process and scrubbed before it is returned to the model.
+    """
+    for label, value in (("cluster", cluster), ("namespace", namespace), ("pod", pod)):
+        if not value or not _valid_ident(value):
+            return f"Invalid {label}: {value!r}"
+    if container and not _valid_ident(container):
+        return f"Invalid container: {container!r}"
+
+    tail = max(1, min(int(tail), _LOGS_MAX_TAIL))
+
+    argv = [
+        "kubectl", "--context", cluster,
+        "logs", pod, "-n", namespace,
+        f"--tail={tail}",
+    ]
+    if container:
+        argv += ["-c", container]
+    if previous:
+        argv.append("--previous")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+    except asyncio.TimeoutError:
+        return f"kubectl logs timed out for {namespace}/{pod} on {cluster}."
+    except Exception as exc:  # noqa: BLE001 — surface kubectl/exec failures to the agent
+        return f"Failed to run kubectl logs: {exc}"
+
+    if proc.returncode != 0:
+        return f"kubectl logs failed ({namespace}/{pod} on {cluster}): {err.decode(errors='replace').strip()}"
+
+    raw = out.decode(errors="replace")
+    if not raw.strip():
+        return f"No log output for {namespace}/{pod} on {cluster} (tail={tail})."
+    return redact(raw)
+
+
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
@@ -119,7 +189,43 @@ async def list_tools() -> list[types.Tool]:
                 },
                 "required": ["query"],
             },
-        )
+        ),
+        types.Tool(
+            name="get_logs",
+            description=(
+                "Read recent logs from a single pod (read-only `kubectl logs`). "
+                "This is the ONLY way to read pod logs — raw `kubectl logs` in Bash is blocked. "
+                "Output is automatically scrubbed of personal data (emails, phone numbers, "
+                "national IDs, payment cards, tokens, names) before being returned. "
+                "Always scope to the exact namespace/pod from the alert or the resource under investigation."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "cluster": {
+                        "type": "string",
+                        "description": "Exact kubectl context name, e.g. production-cluster (resolve aliases first).",
+                    },
+                    "namespace": {"type": "string", "description": "Pod namespace."},
+                    "pod": {"type": "string", "description": "Pod name."},
+                    "container": {
+                        "type": "string",
+                        "description": "Container name (optional; needed for multi-container pods).",
+                    },
+                    "tail": {
+                        "type": "integer",
+                        "description": "Number of trailing lines (default 100, max 200).",
+                        "default": 100,
+                    },
+                    "previous": {
+                        "type": "boolean",
+                        "description": "Read logs from the previous terminated container instance (optional).",
+                        "default": False,
+                    },
+                },
+                "required": ["cluster", "namespace", "pod"],
+            },
+        ),
     ]
 
 
@@ -131,6 +237,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             cluster=arguments.get("cluster"),
             kind=arguments.get("kind"),
             limit=arguments.get("limit", 5),
+        )
+        return [types.TextContent(type="text", text=result)]
+    if name == "get_logs":
+        result = await _get_logs(
+            cluster=arguments["cluster"],
+            namespace=arguments["namespace"],
+            pod=arguments["pod"],
+            container=arguments.get("container"),
+            tail=arguments.get("tail", 100),
+            previous=arguments.get("previous", False),
         )
         return [types.TextContent(type="text", text=result)]
     raise ValueError(f"Unknown tool: {name}")

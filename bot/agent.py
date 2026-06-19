@@ -72,7 +72,9 @@ BLOCKED_BASH_PATTERNS: list[str] = [
     "kubectl cp",            # copy files from/to pods
     "kubectl proxy",         # exposes API server
     "kubectl port-forward",  # network exposure
-    # kubectl logs is allowed but must use --tail (enforced in can_use_tool)
+    # Logs — raw kubectl logs is blocked: its output bypasses our code and cannot
+    # be redacted of PII. Use the get_logs MCP tool, which scrubs PII before return.
+    "kubectl logs",
     # Shell — file system
     "rm ",
     "rm\t",
@@ -125,20 +127,18 @@ async def can_use_tool(
         if m:
             pattern = m.group().lower()
             logger.warning("Blocked command: %s", command[:120])
-            return PermissionResultDeny(
-                message=(
+            if pattern == "kubectl logs":
+                message = (
+                    "Raw 'kubectl logs' is blocked. Use the get_logs tool instead "
+                    "(args: cluster, namespace, pod, optional container/tail) — it returns "
+                    "the same logs with personal data redacted."
+                )
+            else:
+                message = (
                     f"Blocked: pattern '{pattern}' is not allowed. "
                     "Only read-only operations are permitted."
-                ),
-                interrupt=True,
-            )
-        # kubectl logs must always include --tail to prevent unbounded output
-        if "kubectl logs" in command and "--tail" not in command:
-            logger.warning("Blocked kubectl logs without --tail: %s", command[:120])
-            return PermissionResultDeny(
-                message="kubectl logs requires --tail=N (e.g. --tail=100). Retry with --tail.",
-                interrupt=False,
-            )
+                )
+            return PermissionResultDeny(message=message, interrupt=True)
     return PermissionResultAllow(updated_input=input_data)
 
 
@@ -216,7 +216,10 @@ _BASE_SYSTEM_PROMPT = (
     "and tell the user: 'Cluster X is not accessible. Available clusters: development-cluster, infra-cluster.'\n"
     "- If kubectl fails with connection errors, certificate errors, or timeout — explicitly tell the user "
     "which cluster is unreachable. Do NOT retry with different commands.\n"
-    "- kubectl logs is allowed but MUST include --tail=N (max 200). Without --tail it will be blocked.\n\n"
+    "- DO NOT read pod logs with 'kubectl logs' — it is blocked. Use the get_logs tool "
+    "(args: cluster, namespace, pod, optional container/tail up to 200). It returns the same logs "
+    "with personal data (emails, phones, national IDs, cards, tokens, names) automatically redacted. "
+    "Always scope get_logs to the exact namespace/pod under investigation.\n\n"
     "GITOPS AWARENESS:\n"
     "- Before suggesting any change to a resource, check for ArgoCD annotations: "
     "argocd.argoproj.io/tracking-id or argocd.argoproj.io/managed-by.\n"
@@ -274,7 +277,7 @@ OPTIONS = ClaudeAgentOptions(
     system_prompt=SYSTEM_PROMPT,
     model="claude-haiku-4-5-20251001",
     permission_mode="bypassPermissions",
-    allowed_tools=["Bash", "Agent", "mcp__infra__search_infrastructure"],
+    allowed_tools=["Bash", "Agent", "mcp__infra__search_infrastructure", "mcp__infra__get_logs"],
     disallowed_tools=["Write", "Edit", "NotebookEdit"],  # never write files
     max_turns=_MAX_TURNS,
     cwd="/app",
@@ -289,7 +292,7 @@ OPTIONS = ClaudeAgentOptions(
                 "Execute tasks quickly and report findings concisely. "
                 + _SUBAGENT_PROMPT_SUFFIX
             ),
-            tools=["Bash"],
+            tools=["Bash", "mcp__infra__get_logs"],
             model="haiku",
         ),
         "sonnet": AgentDefinition(
@@ -299,7 +302,7 @@ OPTIONS = ClaudeAgentOptions(
                 "Analyze problems thoroughly and provide clear, prioritized action steps. "
                 + _SUBAGENT_PROMPT_SUFFIX
             ),
-            tools=["Bash"],
+            tools=["Bash", "mcp__infra__get_logs"],
             model="sonnet",
         ),
         "opus": AgentDefinition(
@@ -309,7 +312,7 @@ OPTIONS = ClaudeAgentOptions(
                 "Perform deep analysis and think through all implications carefully. "
                 + _SUBAGENT_PROMPT_SUFFIX
             ),
-            tools=["Bash"],
+            tools=["Bash", "mcp__infra__get_logs"],
             model="opus",
         ),
     },
