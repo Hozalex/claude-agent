@@ -1,16 +1,15 @@
+import dataclasses
 import logging
 import os
 import re
 from pathlib import Path
 
-from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition, HookMatcher
 from claude_agent_sdk.types import (
     AssistantMessage,
     TextBlock,
     ResultMessage,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    ToolPermissionContext,
+    HookContext,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,98 +47,107 @@ def _make_api_error(code: str) -> ClaudeAPIError:
 # ── Safety ────────────────────────────────────────────────────────────────────
 
 # Bash commands that are never allowed, regardless of skill or user request.
-# Checked as substrings of the full command (case-insensitive).
-BLOCKED_BASH_PATTERNS: list[str] = [
-    # Kubernetes — destructive mutations
-    "kubectl delete",
-    "kubectl apply",
-    "kubectl create",
-    "kubectl patch",
-    "kubectl edit",
-    "kubectl replace",
-    "kubectl rollout restart",
-    "kubectl rollout undo",
-    "kubectl scale",
-    "kubectl drain",
-    "kubectl cordon",
-    "kubectl uncordon",
-    "kubectl taint",
-    # Kubernetes — sensitive data
-    "kubectl get secret",
-    "kubectl get secrets",
-    "kubectl describe secret",
-    "kubectl exec",          # shell into pods
-    "kubectl cp",            # copy files from/to pods
-    "kubectl proxy",         # exposes API server
-    "kubectl port-forward",  # network exposure
+#
+# Matching is word- and position-aware, NOT plain substring: a naive "rm " pattern
+# also matched inside "smsfin-platform 2>&1" and blocked ordinary read-only kubectl
+# calls. Dangerous binaries are therefore only matched at the start of a command,
+# and kubectl verbs are matched as whole words within one command segment (which
+# also catches indirection like `$KUBECTL port-forward`).
+
+# kubectl invoked directly or through a shell variable.
+_KUBECTL = r"(?:kubectl|\$\{?KUBECTL\}?)"
+# Rest of the same command segment — stops at a pipe/semicolon/newline.
+_SEG = r"[^;|&\n]*?"
+# A dangerous binary only counts when it starts a command.
+_CMD_START = r"(?:\A|[\n;&|(`]|\$\()\s*"
+
+BLOCKED_BASH_RULES: list[tuple[str, re.Pattern[str]]] = [
     # Logs — raw kubectl logs is blocked: its output bypasses our code and cannot
     # be redacted of PII. Use the get_logs MCP tool, which scrubs PII before return.
-    "kubectl logs",
-    # Shell — file system
-    "rm ",
-    "rm\t",
-    "rmdir",
-    "shred",
-    " > /",                  # redirect writes to absolute paths
-    "tee /",
-    # Shell — privilege escalation
-    "sudo ",
-    "su ",
-    "chmod ",
-    "chown ",
-    # Secrets — environment variables
-    "printenv",
-    "env ",
-    "env\t",
-    "env\n",
-    "DATABASE_URL",
-    "ANTHROPIC_API_KEY",
-    "BOT_TOKEN",
-    # Secrets — sensitive filesystem paths
-    "/proc/self/environ",   # env vars via procfs
-    "/proc/self/mem",       # process memory
-    "/var/run/secrets/",    # k8s service account token
-    "~/.ssh/",              # SSH keys
-    "~/.aws/",              # AWS credentials
-    "~/.kube/",             # kubeconfig (use in-cluster SA instead)
-    # Secrets — bot source and config
-    "/app/bot/",            # bot source code (contains logic, not secrets, but unnecessary)
-    "/app/.env",            # env file if present
+    ("kubectl logs", re.compile(rf"{_KUBECTL}{_SEG}\blogs\b", re.IGNORECASE)),
+    # Kubernetes — destructive mutations
+    ("kubectl mutation", re.compile(
+        rf"{_KUBECTL}{_SEG}\b(?:delete|apply|create|patch|edit|replace|scale|drain|"
+        rf"cordon|uncordon|taint)\b", re.IGNORECASE)),
+    ("kubectl rollout restart/undo", re.compile(
+        rf"{_KUBECTL}{_SEG}\brollout\s+(?:restart|undo)\b", re.IGNORECASE)),
+    # Kubernetes — pod access and network exposure
+    ("kubectl pod access", re.compile(
+        rf"{_KUBECTL}{_SEG}\b(?:exec|cp|attach|debug)\b", re.IGNORECASE)),
+    ("kubectl network exposure", re.compile(
+        rf"{_KUBECTL}{_SEG}\b(?:proxy|port-forward)\b", re.IGNORECASE)),
+    # Kubernetes — secrets
+    ("kubectl secrets", re.compile(
+        rf"{_KUBECTL}{_SEG}\b(?:get|describe)\b{_SEG}\bsecrets?\b", re.IGNORECASE)),
+    # Shell — destructive / privilege escalation / env dumping, at command start only
+    ("dangerous command", re.compile(
+        _CMD_START + r"(?:rm|rmdir|shred|sudo|su|chmod|chown|printenv|env|tee)\b",
+        re.IGNORECASE)),
+    ("write to absolute path", re.compile(r">\s*/")),
+    # Secrets — sensitive paths and variables (specific enough to match literally)
+    ("sensitive path or variable", re.compile(
+        r"/proc/self/(?:environ|mem)|/var/run/secrets/|~/\.(?:ssh|aws|kube)/"
+        r"|/app/bot/|/app/\.env|DATABASE_URL|ANTHROPIC_API_KEY|BOT_TOKEN",
+        re.IGNORECASE)),
 ]
 
-# Compiled once at module load for fast case-insensitive matching in can_use_tool.
-# Replaces the per-call loop that repeatedly called pattern.lower() on all 40+ entries.
-_BLOCKED_BASH_REGEX: re.Pattern[str] = re.compile(
-    "|".join(re.escape(p) for p in BLOCKED_BASH_PATTERNS),
-    re.IGNORECASE,
-)
 
-
-async def can_use_tool(
-    tool_name: str,
-    input_data: dict,
-    context: ToolPermissionContext,
-) -> PermissionResultAllow | PermissionResultDeny:
-    """Block dangerous bash commands before execution."""
-    if tool_name == "Bash":
-        command = input_data.get("command", "")
-        m = _BLOCKED_BASH_REGEX.search(command)
+def find_blocked_rule(command: str) -> tuple[str, str] | None:
+    """Return (rule name, matched text) for the first rule the command trips."""
+    for rule, pattern in BLOCKED_BASH_RULES:
+        m = pattern.search(command)
         if m:
-            pattern = m.group().lower()
-            logger.warning("Blocked command: %s", command[:120])
-            if pattern == "kubectl logs":
-                message = (
-                    "Raw 'kubectl logs' is blocked. Use the get_logs tool instead "
-                    "(args: cluster, namespace, pod, optional container/tail) — it returns "
-                    "the same logs with personal data redacted."
-                )
-            else:
-                message = (
-                    f"Blocked: pattern '{pattern}' is not allowed. "
-                    "Only read-only operations are permitted."
-                )
-            return PermissionResultDeny(message=message, interrupt=True)
-    return PermissionResultAllow(updated_input=input_data)
+            return rule, m.group().strip()
+    return None
+
+
+async def pre_tool_use_guard(
+    input_data: dict,
+    tool_use_id: str | None,
+    context: HookContext,
+) -> dict:
+    """Block dangerous bash commands before execution.
+
+    Registered as a PreToolUse hook rather than as `can_use_tool`: with
+    permission_mode="bypassPermissions" the SDK auto-approves every tool call and
+    never consults can_use_tool (it warns about this as CanUseToolShadowedWarning),
+    so that callback silently enforced nothing. Hooks still run, and they also fire
+    for tool calls made by subagents — which is where the skills run kubectl.
+    """
+    if input_data.get("tool_name") != "Bash":
+        return {}
+
+    command = (input_data.get("tool_input") or {}).get("command", "")
+    hit = find_blocked_rule(command)
+    if hit is None:
+        return {}
+
+    rule, matched = hit
+    logger.warning("Blocked command [%s on %r]: %s", rule, matched, command[:120])
+    if rule == "kubectl logs":
+        reason = (
+            "Raw 'kubectl logs' is blocked. Use the get_logs tool instead "
+            "(args: cluster, namespace, pod, optional container/tail) — it returns "
+            "the same logs with personal data redacted."
+        )
+    elif rule == "kubectl network exposure":
+        reason = (
+            "port-forward and proxy are blocked. To read metrics use the query_metrics "
+            "tool (args: cluster, query, optional lookback) — it reaches Prometheus for you. "
+            "Do not try to tunnel to it yourself."
+        )
+    else:
+        reason = (
+            f"Blocked by rule '{rule}' (matched {matched!r}). "
+            "Only read-only operations are permitted."
+        )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 # ── Skill routing ──────────────────────────────────────────────────────────────
@@ -238,7 +246,24 @@ _BASE_SYSTEM_PROMPT = (
     "(scaling nodes, changing Git config, enabling features). Pure diagnostics belong in your analysis.\n"
     "- STOP AND DECLARE LIMITS: If the requested information (e.g. message contents, application logs, "
     "network traffic) is not accessible through search_infrastructure or kubectl read-only commands — "
-    "say so immediately. Do NOT attempt multiple alternative approaches. One attempt per tool, then conclude.\n\n"
+    "say so immediately. Do NOT attempt multiple alternative approaches. One attempt per tool, then conclude.\n"
+    "- ALERT STATE COMES FROM ALERTMANAGER: When triaging an alert, call get_alerts (filtered by cluster "
+    "and alertname) to check whether it is STILL FIRING or already resolved, and to see what else is "
+    "firing in the same namespace — correlated alerts usually point at the real cause. Never ask the user "
+    "whether an alert is still active. Note: one Alertmanager (infra cluster) holds alerts from every "
+    "cluster, and the 'cluster' label there is the SHORT name (prod / stage / dev / infra) — the tool maps "
+    "context names for you, so just pass production-cluster.\n"
+    "- HISTORY LIVES IN METRICS: kubectl shows only the CURRENT state and events are short-lived, so for "
+    "ANY question about the past ('was there a problem yesterday', 'check monitoring for that time', "
+    "'did it recover', 'how long did it last') use the query_metrics tool with a lookback window. "
+    "Never answer a question about the past from kubectl alone, and never tell the user history is "
+    "unavailable without having tried query_metrics. Prometheus retention is about 10 days — if the "
+    "window is older than that, say so. If query_metrics reports Prometheus is unconfigured or "
+    "unreachable, state that plainly instead of guessing.\n"
+    "- DO NOT INTERROGATE THE USER: Never ask for facts already present in this conversation (cluster, "
+    "namespace, pod, instance and time are usually right there in the alert text). Re-read the conversation "
+    "first. Ask a clarifying question ONLY when the information is genuinely absent and the task cannot "
+    "proceed without it.\n\n"
     # "TOOL USAGE: Logs & Metrics\n"  # TODO: enable when log/metric tools are added
     "OUTPUT FORMATTING (TELEGRAM OPTIMIZED):\n"
     "- Use plain text only. No markdown, no headers, no bold, no backticks.\n"
@@ -277,12 +302,18 @@ OPTIONS = ClaudeAgentOptions(
     system_prompt=SYSTEM_PROMPT,
     model="claude-haiku-4-5-20251001",
     permission_mode="bypassPermissions",
-    allowed_tools=["Bash", "Agent", "mcp__infra__search_infrastructure", "mcp__infra__get_logs"],
+    allowed_tools=[
+        "Bash", "Agent",
+        "mcp__infra__search_infrastructure",
+        "mcp__infra__get_logs",
+        "mcp__infra__query_metrics",
+        "mcp__infra__get_alerts",
+    ],
     disallowed_tools=["Write", "Edit", "NotebookEdit"],  # never write files
     max_turns=_MAX_TURNS,
     cwd="/app",
     setting_sources=["project"],
-    can_use_tool=can_use_tool,
+    hooks={"PreToolUse": [HookMatcher(matcher="Bash", hooks=[pre_tool_use_guard])]},
     stderr=_on_stderr,
     agents={
         "haiku": AgentDefinition(
@@ -292,7 +323,12 @@ OPTIONS = ClaudeAgentOptions(
                 "Execute tasks quickly and report findings concisely. "
                 + _SUBAGENT_PROMPT_SUFFIX
             ),
-            tools=["Bash", "mcp__infra__get_logs"],
+            tools=[
+                "Bash",
+                "mcp__infra__get_logs",
+                "mcp__infra__query_metrics",
+                "mcp__infra__get_alerts",
+            ],
             model="haiku",
         ),
         "sonnet": AgentDefinition(
@@ -302,7 +338,12 @@ OPTIONS = ClaudeAgentOptions(
                 "Analyze problems thoroughly and provide clear, prioritized action steps. "
                 + _SUBAGENT_PROMPT_SUFFIX
             ),
-            tools=["Bash", "mcp__infra__get_logs"],
+            tools=[
+                "Bash",
+                "mcp__infra__get_logs",
+                "mcp__infra__query_metrics",
+                "mcp__infra__get_alerts",
+            ],
             model="sonnet",
         ),
         "opus": AgentDefinition(
@@ -312,11 +353,43 @@ OPTIONS = ClaudeAgentOptions(
                 "Perform deep analysis and think through all implications carefully. "
                 + _SUBAGENT_PROMPT_SUFFIX
             ),
-            tools=["Bash", "mcp__infra__get_logs"],
+            tools=[
+                "Bash",
+                "mcp__infra__get_logs",
+                "mcp__infra__query_metrics",
+                "mcp__infra__get_alerts",
+            ],
             model="opus",
         ),
     },
 )
+
+# ── Conversation continuation ──────────────────────────────────────────────────
+
+# Every query() call starts a fresh Claude session unless we resume an existing one.
+# Without this a follow-up message ("check the monitoring for that alert") arrives
+# with an empty context and the agent has to ask the user for facts it already had.
+_RESUME_SUPPORTED = dataclasses.is_dataclass(ClaudeAgentOptions) and any(
+    f.name == "resume" for f in dataclasses.fields(ClaudeAgentOptions)
+)
+if not _RESUME_SUPPORTED:
+    logger.warning(
+        "Installed claude-agent-sdk has no 'resume' option — "
+        "follow-up messages will start a new session and lose context"
+    )
+
+# API errors that mean "retrying won't help" — never fall back to a fresh session for these.
+_FATAL_API_ERRORS = {
+    "billing_error", "rate_limit_error", "authentication_error", "overloaded_error",
+}
+
+
+def _options_for(session_id: str | None) -> ClaudeAgentOptions:
+    """Base options, plus `resume` when continuing an existing conversation."""
+    if session_id and _RESUME_SUPPORTED:
+        return dataclasses.replace(OPTIONS, resume=session_id)
+    return OPTIONS
+
 
 # ── Model label helpers ────────────────────────────────────────────────────────
 
@@ -334,17 +407,21 @@ def _short_model(raw_name: str) -> str:
 # ── Main query ─────────────────────────────────────────────────────────────────
 
 async def _as_stream(text: str):
-    """Wrap a plain string as AsyncIterable — required for can_use_tool."""
+    """Wrap a plain string as AsyncIterable — streaming input mode, required for hooks."""
     yield {"type": "user", "message": {"role": "user", "content": text}}
 
 
-async def ask_claude(prompt: str) -> tuple[str, str | None]:
-    """Send a prompt to Claude. Returns (response_text, cost_info)."""
+async def _run_query(
+    prompt: str,
+    session_id: str | None,
+) -> tuple[str, str | None, str | None]:
+    """One query() run. Returns (response_text, cost_info, session_id)."""
     response_parts: list[str] = []
     cost_info: str | None = None
     models_seen: list[str] = []  # ordered, deduped
+    new_session_id: str | None = None
 
-    async for message in query(prompt=_as_stream(prompt), options=OPTIONS):
+    async for message in query(prompt=_as_stream(prompt), options=_options_for(session_id)):
         logger.debug("SDK message: type=%s %s", type(message).__name__, vars(message))
         if isinstance(message, AssistantMessage):
             error_code = getattr(message, "error", None)
@@ -365,10 +442,42 @@ async def ask_claude(prompt: str) -> tuple[str, str | None]:
             turns = message.num_turns
             models_str = " + ".join(models_seen) if models_seen else "?"
             cost_info = f"{models_str} · ${cost:.4f} · {duration_s:.1f}s · {turns} turns"
+            new_session_id = message.session_id
             if message.is_error:
                 logger.error("Session %s error: subtype=%s", message.session_id, message.subtype)
                 raise _make_api_error(message.subtype or "session_error")
             logger.info("Session %s finished: %s", message.session_id, cost_info)
 
     text = "".join(response_parts) or "No response from Claude."
-    return text, cost_info
+    return text, cost_info, new_session_id
+
+
+async def ask_claude(
+    prompt: str,
+    session_id: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Send a prompt to Claude, continuing `session_id` when given.
+
+    Returns (response_text, cost_info, session_id) — pass the returned session id
+    back on the next message to keep the conversation context.
+
+    A stored session can be gone (pod restart wipes the CLI's session files), so a
+    failed resume falls back to a fresh session instead of breaking the chat.
+    """
+    try:
+        return await _run_query(prompt, session_id)
+    except ClaudeAPIError as exc:
+        if session_id and exc.code not in _FATAL_API_ERRORS:
+            logger.warning(
+                "Resume of session %s failed (%s) — retrying with a fresh session",
+                session_id, exc.code,
+            )
+            return await _run_query(prompt, None)
+        raise
+    except Exception:
+        if session_id:
+            logger.exception(
+                "Resume of session %s failed — retrying with a fresh session", session_id
+            )
+            return await _run_query(prompt, None)
+        raise

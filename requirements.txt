@@ -4,4 +4,7 @@ python-dotenv
 anyio
 asyncpg==0.30.0
 httpx==0.28.1
-mcp>=1.0.0
+# Pinned to 1.x: mcp 2.x dropped the @server.list_tools()/@server.call_tool()
+# decorator API this server is built on, so an unpinned rebuild silently broke
+# every infra tool. claude-agent-sdk allows >=1.23.0,<3.0.0.
+mcp>=1.23,<2.0
